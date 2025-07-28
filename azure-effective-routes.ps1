@@ -1,147 +1,84 @@
-[CmdletBinding()]
-param (
-    [parameter(Mandatory = $true)]
-    [string] $filepath,
+<#
+.SYNOPSIS
+    Gets effective route tables for all network interfaces in a subscription and exports to CSV.
+.DESCRIPTION
+    This script retrieves all network interfaces in the current Azure subscription,
+    gets the effective route table for each, and exports the combined results to a CSV file.
+.NOTES
+    File Name      : Get-EffectiveRouteTables.ps1
+    Prerequisites  : Azure PowerShell module (Az)
+    Version        : 1.0
+#>
 
-    [parameter(Mandatory = $true)]
-    [string] $subscriptionId,
-
-    [parameter(Mandatory = $false)]
-    [array] $exclvnets,
-
-    [parameter(Mandatory = $false)]
-    [array] $exclsubnets
-)
-
-function ParseAzNetworkInterfaceID {
-    param ([string]$resourceID)
-    if ($resourceID -notmatch "/subscriptions/.+/resourceGroups/.+/providers/Microsoft.Network/networkInterfaces/.+") {
-        return $null
-    }
-    $array = $resourceID.Split('/')
-    return @($array[2], $array[4], $array[-1])
+# Connect to Azure (if not already connected)
+if (-not (Get-AzContext)) {
+    Connect-AzAccount
 }
 
-function LoadModule ($m) {
-    if (!(Get-Module -Name $m)) {
-        if (!(Get-Module -ListAvailable -Name $m)) {
-            Install-Module -Name $m -Force -Scope CurrentUser
-        }
-        Import-Module $m -Force
-    }
+# Select the subscription (if you have multiple)
+$subscription = Get-AzSubscription | Out-GridView -Title "Select a subscription" -PassThru
+if ($subscription) {
+    Set-AzContext -Subscription $subscription.Id
 }
-
-# Load required modules
-LoadModule "Az.Accounts"
-LoadModule "Az.Network"
-LoadModule "Az.Compute"
-
-Connect-AzAccount
-Set-AzContext -SubscriptionId $subscriptionId
-
-# Validate output path
-if (!(Test-Path $filepath)) {
-    Write-Error "Invalid file path: $filepath"
+else {
+    Write-Error "No subscription selected. Exiting."
     exit
 }
 
-$excludedsubnets = @("AzureBastionSubnet", "RouteServerSubnet")
-if ($exclsubnets) {
-    $excludedsubnets += $exclsubnets
-    $excludedsubnets = $excludedsubnets | Select-Object -Unique
+# Initialize an array to store all route table results
+$allRoutes = @()
+
+# Get all network interfaces in the subscription
+$networkInterfaces = Get-AzNetworkInterface
+
+if (-not $networkInterfaces) {
+    Write-Output "No network interfaces found in the subscription."
+    exit
 }
 
-$outputs = [System.Collections.Generic.List[PSObject]]::new()
-$vnets = Get-AzVirtualNetwork | Where-Object {$exclvnets -notcontains $_.Name}
-
-foreach ($vnet in $vnets) {
-    $snets = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $vnet
-    $snets = $snets | Where-Object {$excludedsubnets -notcontains $_.Name}
-
-    foreach ($snet in $snets) {
-        if (-not $snet.IpConfigurations.Id) { continue }
-
-        $bgppropagation = ""
-        $rtname = ""
-        $internetaccess = ""
-        $inetroutes = ""
-        $gatewayroutes = ""
-        $vngroutesaddprefix = ""
-        $vngroutesnexthop = ""
-        $applianceroutes = ""
-        $nvaprefix = ""
-        $nvanexthop = ""
-        $effroutes = "No"
-
-        $rtattached = if ($snet.RouteTable) { "Yes" } else { "No" }
-        $rtname = if ($snet.RouteTable) { ($snet.RouteTable.ID.Split("/") | Select-Object -Last 1) } else { "" }
-
-        $vmnicInfo = ParseAzNetworkInterfaceID -resourceID $snet.IpConfigurations.Id
-        if (!$vmnicInfo -or $vmnicInfo.Count -lt 3) {
-            Write-Warning "Could not parse NIC info for subnet $($snet.Name)"
-            continue
+# Process each network interface
+foreach ($nic in $networkInterfaces) {
+    Write-Output "Processing NIC: $($nic.Name) in Resource Group: $($nic.ResourceGroupName)"
+    
+    try {
+        # Get the effective route table
+        $routeTable = Get-AzEffectiveRouteTable -NetworkInterfaceName $nic.Name -ResourceGroupName $nic.ResourceGroupName
+        
+        # Add properties to identify which NIC this belongs to
+        foreach ($route in $routeTable) {
+            $route | Add-Member -NotePropertyName "NetworkInterfaceName" -NotePropertyValue $nic.Name
+            $route | Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue $nic.ResourceGroupName
+            $route | Add-Member -NotePropertyName "Location" -NotePropertyValue $nic.Location
         }
-
-        $vmnic = Get-AzNetworkInterface -Name $vmnicInfo[2] -ResourceGroupName $vmnicInfo[1]
-
-        if ($vmnic.VirtualMachine) {
-            $vmName = ($vmnic.VirtualMachine.Id.Split("/") | Select-Object -Last 1)
-            $vm = Get-AzVM -Name $vmName -ResourceGroupName $vmnicInfo[1] -Status
-            if ($vm.PowerState -ne "VM running") {
-                Write-Warning "VM $($vm.Name) is not powered on. Attempting to get effective routes anyway..."
-            }
-
-            try {
-                $nicroutes = Get-AzEffectiveRouteTable -ResourceGroupName $vmnicInfo[1] -NetworkInterfaceName $vmnic.Name
-                $effroutes = "Yes"
-
-                $bgppropagation = if ($nicroutes | Where-Object {$_.DisableBgpRoutePropagation -eq "True"}) { "Disabled" } else { "Enabled" }
-
-                $internetRoutes = $nicroutes | Where-Object {$_.NextHopType -eq "Internet"}
-                $internetaccess = if ($internetRoutes) { "Enabled" } else { "Disabled" }
-                $inetroutes = $internetRoutes.AddressPrefix -join ", "
-
-                $gatewayRoutes = $nicroutes | Where-Object {$_.NextHopType -eq "VirtualNetworkGateway"}
-                $gatewayroutes = if ($gatewayRoutes) { "Enabled" } else { "Disabled" }
-                $vngroutesaddprefix = $gatewayRoutes.AddressPrefix -join ", "
-                $vngroutesnexthop = ($gatewayRoutes.NextHopIpAddress | Select-Object -Unique) -join ", "
-
-                $applianceRoutes = $nicroutes | Where-Object {$_.NextHopType -eq "VirtualAppliance"}
-                $applianceroutes = if ($applianceRoutes) { "Enabled" } else { "Disabled" }
-                $nvaprefix = $applianceRoutes.AddressPrefix -join ", "
-                $nvanexthop = ($applianceRoutes.NextHopIpAddress | Select-Object -Unique) -join ", "
-            }
-            catch {
-                Write-Warning "Failed to get effective routes for NIC $($vmnic.Name): $_"
-                $effroutes = "Error"
-            }
-        } else {
-            Write-Warning "NIC $($vmnic.Name) is not attached to a VM."
-        }
-
-        $output = [PSCustomObject]@{
-            "Subscription ID"                        = $subscriptionId
-            "vNet Name"                              = $vnet.Name
-            "Subnet Name"                            = $snet.Name
-            "EffectiveRoutes"                        = $effroutes
-            "RouteTable Attached"                    = $rtattached
-            "RouteTable Name"                        = $rtname
-            "BGP Propagation"                        = $bgppropagation
-            "Internet Routes"                        = $internetaccess
-            "InternetAddress Prefix"                 = $inetroutes
-            "VirtualNetworkGateway Routes"           = $gatewayroutes
-            "VirtualNetworkGateway AddressPrefix"    = $vngroutesaddprefix
-            "VirtualNetworkGateway NextHopIP"        = $vngroutesnexthop
-            "NetworkVirtualAppliance Routes"         = $applianceroutes
-            "NetworkVirtualAppliance AddressPrefix"  = $nvaprefix
-            "NetworkVirtualAppliance NextHopIP"      = $nvanexthop
-        }
-
-        $outputs.Add($output)
+        
+        # Add to the collection
+        $allRoutes += $routeTable
+    }
+    catch {
+        Write-Warning "Failed to get route table for NIC $($nic.Name): $_"
     }
 }
 
 # Export to CSV
-$outputFilePath = Join-Path $filepath "AzureEffectiveRoutes.csv"
-$outputs | Export-Csv -Path $outputFilePath -NoTypeInformation -Force
-Write-Host "✅ Effective routes exported to: $outputFilePath"
+if ($allRoutes.Count -gt 0) {
+    $outputFile = "EffectiveRouteTables_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    $allRoutes | Export-Csv -Path $outputFile -NoTypeInformation -Force
+    Write-Output "Exported $($allRoutes.Count) routes to $outputFile"
+    
+    # Verify the file was created properly
+    if (Test-Path $outputFile) {
+        $fileInfo = Get-Item $outputFile
+        if ($fileInfo.Length -gt 0) {
+            Write-Output "CSV file created successfully with data."
+        }
+        else {
+            Write-Warning "CSV file was created but is empty. Check if there were any routes returned."
+        }
+    }
+    else {
+        Write-Error "Failed to create CSV file."
+    }
+}
+else {
+    Write-Output "No route tables were retrieved to export."
+}
