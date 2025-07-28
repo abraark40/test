@@ -1,39 +1,61 @@
-# OPTIONAL: Set the subscription (replace if needed)
-$subscriptionId = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Replace with your subscription ID
+# Set the subscription (update this if needed)
+$subscriptionId = "your-subscription-id-here"
 Set-AzContext -SubscriptionId $subscriptionId
 
-# Get all NICs in the subscription
+# Get all NICs
 $allNics = Get-AzNetworkInterface
 
-# List to hold matching NIC names
+# Store results here
 $matchingNics = @()
 
 foreach ($nic in $allNics) {
     $nicName = $nic.Name
-    $resourceGroup = $nic.ResourceGroupName
+    $rg = $nic.ResourceGroupName
+    $vmId = $nic.VirtualMachine.Id
+
+    # Skip if NIC is not attached to a VM
+    if (-not $vmId) {
+        Write-Host "⚠️ NIC '$nicName' is not attached to a VM. Skipping..." -ForegroundColor Yellow
+        continue
+    }
 
     try {
-        $routeTable = Get-AzEffectiveRouteTable -NetworkInterfaceName $nicName -ResourceGroupName $resourceGroup
+        # Get VM object
+        $vm = Get-AzVM -ResourceId $vmId
 
-        $matchingRoutes = $routeTable.Value | Where-Object {
+        # Check VM power state
+        $vmStatus = (Get-AzVM -ResourceGroupName $vm.ResourceGroupName -Name $vm.Name -Status).Statuses | Where-Object { $_.Code -like "PowerState*" }
+        if ($vmStatus.Code -ne "PowerState/running") {
+            Write-Host "⏸️ VM '$($vm.Name)' is not running. Skipping NIC '$nicName'..." -ForegroundColor DarkYellow
+            continue
+        }
+
+        # Get effective route table
+        $routes = Get-AzEffectiveRouteTable -NetworkInterfaceName $nicName -ResourceGroupName $rg
+
+        # Filter routes
+        $matchingRoutes = $routes.Value | Where-Object {
             $_.State -eq "Active" -and
             $_.Source -eq "Default" -and
             $_.NextHopType -eq "Internet"
         }
 
         if ($matchingRoutes) {
-            Write-Host "✅ Matching NIC found: $nicName" -ForegroundColor Green
-            $matchingNics += $nicName
+            Write-Host "✅ Found matching route for NIC: $nicName (VM: $($vm.Name))" -ForegroundColor Green
+            $matchingNics += [PSCustomObject]@{
+                NICName       = $nicName
+                VMName        = $vm.Name
+                ResourceGroup = $rg
+                Location      = $nic.Location
+            }
         }
     } catch {
-        Write-Host "❌ Error checking NIC: $nicName. Error: $_" -ForegroundColor Red
+        Write-Host "❌ Error checking NIC '$nicName': $_" -ForegroundColor Red
     }
 }
 
-# Output final list of NICs
-Write-Host "`n=== NICs with Active, Default, Internet Routes ===" -ForegroundColor Cyan
-$matchingNics | Sort-Object | ForEach-Object { Write-Host $_ }
+# Export to CSV
+$outputFile = "NICsWithInternetRoute.csv"
+$matchingNics | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
 
-# OPTIONAL: Export to CSV
-$matchingNics | Sort-Object | Export-Csv -Path "NICsWithInternetRoute.csv" -NoTypeInformation -Encoding UTF8
-Write-Host "`n📄 Exported matching NICs to NICsWithInternetRoute.csv" -ForegroundColor Yellow
+Write-Host "`n✅ Export complete. File saved as: $outputFile" -ForegroundColor Cyan
