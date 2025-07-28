@@ -34,11 +34,9 @@ foreach ($nic in $allNics) {
         $routes = Get-AzEffectiveRouteTable -NetworkInterfaceName $nicName -ResourceGroupName $rg
 
         # Filter routes
-        $matchingRoutes = $routes.Value | Where-Object {
-            $_.State -eq "Active" -and
-            $_.Source -eq "Default" -and
-            $_.NextHopType -eq "Internet"
-        }
+$matchingRoutes = $routes.Value | Where-Object {
+    $_.State -eq "Active"
+}
 
         if ($matchingRoutes) {
             Write-Host "✅ Found matching route for NIC: $nicName (VM: $($vm.Name))" -ForegroundColor Green
