@@ -61,41 +61,62 @@ foreach ($vnet in $vnets) {
     foreach ($snet in $snets) {
         if (-not $snet.IpConfigurations.Id) { continue }
 
+        $bgppropagation = ""
+        $rtname = ""
+        $internetaccess = ""
+        $inetroutes = ""
+        $gatewayroutes = ""
+        $vngroutesaddprefix = ""
+        $vngroutesnexthop = ""
+        $applianceroutes = ""
+        $nvaprefix = ""
+        $nvanexthop = ""
+        $effroutes = "No"
+
+        $rtattached = if ($snet.RouteTable) { "Yes" } else { "No" }
+        $rtname = if ($snet.RouteTable) { ($snet.RouteTable.ID.Split("/") | Select-Object -Last 1) } else { "" }
+
         $vmnicInfo = ParseAzNetworkInterfaceID -resourceID $snet.IpConfigurations.Id
         if (!$vmnicInfo -or $vmnicInfo.Count -lt 3) {
             Write-Warning "Could not parse NIC info for subnet $($snet.Name)"
             continue
         }
 
-        $rtattached = if ($snet.RouteTable) { "Yes" } else { "No" }
-        $rtname = if ($snet.RouteTable) { ($snet.RouteTable.ID.Split("/") | Select-Object -Last 1) } else { $null }
-
         $vmnic = Get-AzNetworkInterface -Name $vmnicInfo[2] -ResourceGroupName $vmnicInfo[1]
-        if (!$vmnic.VirtualMachine) {
-            $effroutes = "No"
-        } else {
-            $vm = Get-AzVM -Name (($vmnic.VirtualMachine.Id.Split("/") | Select-Object -Last 1)) -ResourceGroupName $vmnicInfo[1] -Status
+
+        if ($vmnic.VirtualMachine) {
+            $vmName = ($vmnic.VirtualMachine.Id.Split("/") | Select-Object -Last 1)
+            $vm = Get-AzVM -Name $vmName -ResourceGroupName $vmnicInfo[1] -Status
             if ($vm.PowerState -ne "VM running") {
-                $effroutes = "No"
-            } else {
-                $nicroutes = Get-AzEffectiveRouteTable -ResourceGroupName $vm.ResourceGroupName -NetworkInterfaceName $vmnic.Name
+                Write-Warning "VM $($vm.Name) is not powered on. Attempting to get effective routes anyway..."
+            }
+
+            try {
+                $nicroutes = Get-AzEffectiveRouteTable -ResourceGroupName $vmnicInfo[1] -NetworkInterfaceName $vmnic.Name
                 $effroutes = "Yes"
+
                 $bgppropagation = if ($nicroutes | Where-Object {$_.DisableBgpRoutePropagation -eq "True"}) { "Disabled" } else { "Enabled" }
 
-                $internetRoutes = $nicroutes | Where-Object {$_.NextHopType -eq "Internet" -and $_.State -eq "Active"}
+                $internetRoutes = $nicroutes | Where-Object {$_.NextHopType -eq "Internet"}
                 $internetaccess = if ($internetRoutes) { "Enabled" } else { "Disabled" }
                 $inetroutes = $internetRoutes.AddressPrefix -join ", "
 
-                $gatewayRoutes = $nicroutes | Where-Object {$_.NextHopType -eq "VirtualNetworkGateway" -and $_.State -eq "Active"}
+                $gatewayRoutes = $nicroutes | Where-Object {$_.NextHopType -eq "VirtualNetworkGateway"}
                 $gatewayroutes = if ($gatewayRoutes) { "Enabled" } else { "Disabled" }
                 $vngroutesaddprefix = $gatewayRoutes.AddressPrefix -join ", "
                 $vngroutesnexthop = ($gatewayRoutes.NextHopIpAddress | Select-Object -Unique) -join ", "
 
-                $applianceRoutes = $nicroutes | Where-Object {$_.Name -ne $null -and $_.NextHopIpAddress -ne $null}
+                $applianceRoutes = $nicroutes | Where-Object {$_.NextHopType -eq "VirtualAppliance"}
                 $applianceroutes = if ($applianceRoutes) { "Enabled" } else { "Disabled" }
                 $nvaprefix = $applianceRoutes.AddressPrefix -join ", "
                 $nvanexthop = ($applianceRoutes.NextHopIpAddress | Select-Object -Unique) -join ", "
             }
+            catch {
+                Write-Warning "Failed to get effective routes for NIC $($vmnic.Name): $_"
+                $effroutes = "Error"
+            }
+        } else {
+            Write-Warning "NIC $($vmnic.Name) is not attached to a VM."
         }
 
         $output = [PSCustomObject]@{
@@ -117,16 +138,10 @@ foreach ($vnet in $vnets) {
         }
 
         $outputs.Add($output)
-
-        # Clear vars safely
-        Clear-Variable -Name @(
-            "bgppropagation", "rtname", "internetaccess", "inetroutes", "gatewayroutes",
-            "vngroutesaddprefix", "vngroutesnexthop", "nvaprefix", "nvanexthop", "applianceroutes", "rtattached"
-        ) -ErrorAction SilentlyContinue
     }
 }
 
 # Export to CSV
 $outputFilePath = Join-Path $filepath "AzureEffectiveRoutes.csv"
 $outputs | Export-Csv -Path $outputFilePath -NoTypeInformation -Force
-Write-Host "Effective routes exported to: $outputFilePath"
+Write-Host "✅ Effective routes exported to: $outputFilePath"
