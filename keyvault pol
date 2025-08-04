@@ -1,13 +1,72 @@
 <#
 .SYNOPSIS
-    Lists all Key Vault access policies across all Azure subscriptions
+    Lists all Key Vault access policies across all Azure subscriptions with RBAC role mapping
 .DESCRIPTION
     This script enumerates all subscriptions accessible to the current user,
-    then lists all Key Vaults and their access policies in each subscription.
+    then lists all Key Vaults and their access policies in each subscription,
+    mapping permissions to the closest matching Azure RBAC role.
 .NOTES
-    File Name      : Get-AllKeyVaultAccessPolicies.ps1
+    File Name      : Get-AllKeyVaultAccessPoliciesWithRBAC.ps1
     Prerequisites  : Azure PowerShell module (Az)
 #>
+
+# Function to determine RBAC role based on permissions
+function Get-KeyVaultRBACRole {
+    param (
+        [string[]]$KeyPermissions,
+        [string[]]$SecretPermissions,
+        [string[]]$CertPermissions
+    )
+
+    # Convert to lowercase for case-insensitive comparison
+    $keyPerms = $KeyPermissions | ForEach-Object { $_.ToLower() }
+    $secretPerms = $SecretPermissions | ForEach-Object { $_.ToLower() }
+    $certPerms = $CertPermissions | ForEach-Object { $_.ToLower() }
+
+    # Define all possible operations for each resource type
+    $allKeyOps = @('get','list','create','update','delete','recover','backup','restore','import','export','purge','decrypt','encrypt','unwrapkey','wrapkey','verify','sign')
+    $allSecretOps = @('get','list','set','delete','recover','backup','restore','purge')
+    $allCertOps = @('get','list','create','update','delete','recover','backup','restore','import','export','purge','managecontacts','manageissuers','getissuers','listissuers','setissuers','deleteissuers')
+
+    # Check for Administrator role (all permissions or wildcard)
+    if (($keyPerms -contains 'all' -or ($keyPerms.Count -ge $allKeyOps.Count)) -and 
+        ($secretPerms -contains 'all' -or ($secretPerms.Count -ge $allSecretOps.Count)) -and 
+        ($certPerms -contains 'all' -or ($certPerms.Count -ge $allCertOps.Count))) {
+        return "Key Vault Administrator"
+    }
+
+    # Check for Crypto Officer (Keys + Secrets)
+    if ((($keyPerms -contains 'all') -or ($keyPerms.Count -ge $allKeyOps.Count)) -and 
+        (($secretPerms -contains 'all') -or ($secretPerms.Count -ge $allSecretOps.Count)) -and 
+        ($certPerms.Count -eq 0 -or $certPerms -eq $null)) {
+        return "Key Vault Crypto Officer"
+    }
+
+    # Check for Secrets Officer (Secrets only)
+    if ((($secretPerms -contains 'all') -or ($secretPerms.Count -ge $allSecretOps.Count)) -and 
+        ($keyPerms.Count -eq 0 -or $keyPerms -eq $null) -and 
+        ($certPerms.Count -eq 0 -or $certPerms -eq $null)) {
+        return "Key Vault Secrets Officer"
+    }
+
+    # Check for Certificates Officer (Certificates only)
+    if ((($certPerms -contains 'all') -or ($certPerms.Count -ge $allCertOps.Count)) -and 
+        ($keyPerms.Count -eq 0 -or $keyPerms -eq $null) -and 
+        ($secretPerms.Count -eq 0 -or $secretPerms -eq $null)) {
+        return "Key Vault Certificates Officer"
+    }
+
+    # Check for Crypto Service Encryption User (specific key operations)
+    $cryptoUserOps = @('get','list','wrapkey','unwrapkey')
+    if (($keyPerms | Where-Object { $_ -in $cryptoUserOps }).Count -eq $cryptoUserOps.Count -and
+        ($secretPerms.Count -eq 0 -or $secretPerms -eq $null) -and
+        ($certPerms.Count -eq 0 -or $certPerms -eq $null)) {
+        return "Key Vault Crypto Service Encryption User"
+    }
+
+    # If no standard role matches
+    return "Custom (Non-Standard Permissions)"
+}
 
 # Clear the screen and show startup message
 Clear-Host
@@ -93,6 +152,11 @@ foreach ($sub in $subscriptions) {
                     Write-Host "    ⚠️ Could not resolve principal name for ObjectId: $($policy.ObjectId)" -ForegroundColor Yellow
                 }
 
+                # Determine RBAC role
+                $rbacRole = Get-KeyVaultRBACRole -KeyPermissions $policy.PermissionsToKeys `
+                                                 -SecretPermissions $policy.PermissionsToSecrets `
+                                                 -CertPermissions $policy.PermissionsToCertificates
+
                 # Add to results
                 $allAccessPolicies += [PSCustomObject]@{
                     SubscriptionName  = $sub.Name
@@ -103,15 +167,16 @@ foreach ($sub in $subscriptions) {
                     PrincipalType     = $principalType
                     ObjectId          = $policy.ObjectId
                     ApplicationId     = $policy.ApplicationId
+                    RBACRole          = $rbacRole
                     KeyRead           = $policy.PermissionsToKeys -contains "Get" -or $policy.PermissionsToKeys -contains "List"
                     KeyWrite          = $policy.PermissionsToKeys -contains "Create" -or $policy.PermissionsToKeys -contains "Set" -or $policy.PermissionsToKeys -contains "Delete"
                     SecretRead        = $policy.PermissionsToSecrets -contains "Get" -or $policy.PermissionsToSecrets -contains "List"
-                    SecretWrite       = $policy.PermissionsToSecrets -contains "Set" -or $policy.PermissionsToSecrets -contains "Delete"
-                    CertRead          = $policy.PermissionsToCertificates -contains "Get" -or $policy.PermissionsToCertificates -contains "List"
-                    CertWrite         = $policy.PermissionsToCertificates -contains "Create" -or $policy.PermissionsToCertificates -contains "Import" -or $policy.PermissionsToCertificates -contains "Delete"
-                    KeyPermissions    = ($policy.PermissionsToKeys -join ", ")
+                    SecretWrite      = $policy.PermissionsToSecrets -contains "Set" -or $policy.PermissionsToSecrets -contains "Delete"
+                    CertRead         = $policy.PermissionsToCertificates -contains "Get" -or $policy.PermissionsToCertificates -contains "List"
+                    CertWrite        = $policy.PermissionsToCertificates -contains "Create" -or $policy.PermissionsToCertificates -contains "Import" -or $policy.PermissionsToCertificates -contains "Delete"
+                    KeyPermissions   = ($policy.PermissionsToKeys -join ", ")
                     SecretPermissions = ($policy.PermissionsToSecrets -join ", ")
-                    CertPermissions   = ($policy.PermissionsToCertificates -join ", ")
+                    CertPermissions  = ($policy.PermissionsToCertificates -join ", ")
                 }
             }
         } catch {
@@ -133,7 +198,7 @@ Write-Host "Total access policies recorded: $($allAccessPolicies.Count)"
 Write-Host "Results saved to: $outputPath`n"
 
 # Show quick summary table
-$allAccessPolicies | Select-Object -First 10 | Format-Table -Property SubscriptionName, KeyVaultName, PrincipalName, PrincipalType, 
+$allAccessPolicies | Select-Object -First 10 | Format-Table -Property SubscriptionName, KeyVaultName, PrincipalName, PrincipalType, RBACRole,
     @{Name="KeyR/W"; Expression={"$($_.KeyRead)/$($_.KeyWrite)"}}, 
     @{Name="SecretR/W"; Expression={"$($_.SecretRead)/$($_.SecretWrite)"}} -AutoSize
 
