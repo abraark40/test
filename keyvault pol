@@ -1,132 +1,88 @@
-<#
-.SYNOPSIS
-    Lists all Azure Key Vaults and their access policies with detailed permissions.
-.DESCRIPTION
-    This script enumerates all Key Vaults in the current Azure subscription and displays
-    each principal's permissions for keys, secrets, and certificates.
-.NOTES
-    File Name      : Get-KeyVaultAccessPolicies.ps1
-    Prerequisites  : Azure PowerShell module (Az), authenticated Azure session
-#>
+# Set the subscription (optional: replace with your subscription ID or name)
+$subscriptionId = "your-subscription-id-here"
+Set-AzContext -SubscriptionId $subscriptionId
 
-# Connect to Azure if not already connected
-if (-not (Get-AzContext)) {
-    Connect-AzAccount
-}
+# Get all Key Vaults in the subscription
+$allKeyVaults = Get-AzKeyVault
 
-# Get all subscriptions (comment out if you only want current subscription)
-$subscriptions = Get-AzSubscription
-if ($subscriptions.Count -gt 1) {
-    Write-Host "Found $($subscriptions.Count) subscriptions. Processing all of them..." -ForegroundColor Yellow
-}
+# Prepare an array to store the results
+$allAccessPolicies = @()
 
-$results = @()
+# Loop through each Key Vault
+foreach ($kv in $allKeyVaults) {
+    $vaultName = $kv.VaultName
+    $rg = $kv.ResourceGroupName
 
-foreach ($sub in $subscriptions) {
-    Set-AzContext -Subscription $sub.Id | Out-Null
-    Write-Host "Processing subscription: $($sub.Name) ($($sub.Id))" -ForegroundColor Cyan
+    Write-Host "Processing Key Vault: $vaultName in RG: $rg" -ForegroundColor Cyan
 
-    # Get all Key Vaults in the subscription
-    $keyVaults = Get-AzKeyVault
+    try {
+        # Get the access policies for this Key Vault
+        $policies = (Get-AzKeyVault -VaultName $vaultName -ResourceGroupName $rg).AccessPolicies
 
-    foreach ($kv in $keyVaults) {
-        Write-Host "`nKey Vault: $($kv.VaultName) (Resource Group: $($kv.ResourceGroupName))" -ForegroundColor Green
-        
-        # Get access policies for the Key Vault
-        $policies = Get-AzKeyVault -VaultName $kv.VaultName -ResourceGroupName $kv.ResourceGroupName | Select-Object -ExpandProperty AccessPolicies
-        
-        if (-not $policies) {
-            Write-Host "  No access policies found for this Key Vault." -ForegroundColor Yellow
-            continue
-        }
-
+        # Process each policy
         foreach ($policy in $policies) {
-            # Determine principal type
-            $principalType = "Unknown"
+            # Try to resolve principal name
             $principalName = "Unknown"
+            $principalType = "Unknown"
             
             try {
-                if ($policy.ObjectId -match "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$") {
-                    # Try to get Azure AD application (service principal)
-                    $app = Get-AzADServicePrincipal -ObjectId $policy.ObjectId -ErrorAction SilentlyContinue
-                    if ($app) {
-                        $principalType = "Service Principal"
-                        $principalName = $app.DisplayName
-                    }
-                    else {
-                        # Try to get Azure AD user
-                        $user = Get-AzADUser -ObjectId $policy.ObjectId -ErrorAction SilentlyContinue
-                        if ($user) {
-                            $principalType = "User"
-                            $principalName = $user.DisplayName
-                        }
-                        else {
-                            # Try to get Azure AD group
-                            $group = Get-AzADGroup -ObjectId $policy.ObjectId -ErrorAction SilentlyContinue
-                            if ($group) {
-                                $principalType = "Group"
-                                $principalName = $group.DisplayName
-                            }
+                # Check if it's a service principal
+                $sp = Get-AzADServicePrincipal -ObjectId $policy.ObjectId -ErrorAction SilentlyContinue
+                if ($sp) {
+                    $principalName = $sp.DisplayName
+                    $principalType = "Service Principal"
+                } else {
+                    # Check if it's a user
+                    $user = Get-AzADUser -ObjectId $policy.ObjectId -ErrorAction SilentlyContinue
+                    if ($user) {
+                        $principalName = $user.DisplayName
+                        $principalType = "User"
+                    } else {
+                        # Check if it's a group
+                        $group = Get-AzADGroup -ObjectId $policy.ObjectId -ErrorAction SilentlyContinue
+                        if ($group) {
+                            $principalName = $group.DisplayName
+                            $principalType = "Group"
                         }
                     }
                 }
-            }
-            catch {
-                Write-Warning "Error looking up principal $($policy.ObjectId): $_"
+            } catch {
+                Write-Host "  ⚠️ Could not resolve principal name for ObjectId: $($policy.ObjectId)" -ForegroundColor Yellow
             }
 
-            # Check permissions
-            $keyPermissions = $policy.PermissionsToKeys -join ", "
-            $secretPermissions = $policy.PermissionsToSecrets -join ", "
-            $certPermissions = $policy.PermissionsToCertificates -join ", "
-            
-            # Create custom object for output
-            $result = [PSCustomObject]@{
-                SubscriptionName    = $sub.Name
-                KeyVaultName       = $kv.VaultName
-                ResourceGroup      = $kv.ResourceGroupName
-                PrincipalName      = $principalName
-                PrincipalType      = $principalType
-                ObjectId           = $policy.ObjectId
-                ApplicationId      = $policy.ApplicationId
-                KeyPermissions     = $keyPermissions
-                SecretPermissions = $secretPermissions
-                CertPermissions   = $certPermissions
-                HasKeyRead         = $policy.PermissionsToKeys -contains "Get" -or $policy.PermissionsToKeys -contains "List"
-                HasKeyWrite       = $policy.PermissionsToKeys -contains "Create" -or $policy.PermissionsToKeys -contains "Set" -or $policy.PermissionsToKeys -contains "Delete"
-                HasSecretRead      = $policy.PermissionsToSecrets -contains "Get" -or $policy.PermissionsToSecrets -contains "List"
-                HasSecretWrite     = $policy.PermissionsToSecrets -contains "Set" -or $policy.PermissionsToSecrets -contains "Delete"
-                HasCertRead       = $policy.PermissionsToCertificates -contains "Get" -or $policy.PermissionsToCertificates -contains "List"
-                HasCertWrite       = $policy.PermissionsToCertificates -contains "Create" -or $policy.PermissionsToCertificates -contains "Import" -or $policy.PermissionsToCertificates -contains "Delete"
+            # Add policy to results
+            $allAccessPolicies += [PSCustomObject]@{
+                KeyVaultName     = $vaultName
+                ResourceGroup    = $rg
+                PrincipalName    = $principalName
+                PrincipalType    = $principalType
+                ObjectId         = $policy.ObjectId
+                ApplicationId    = $policy.ApplicationId
+                KeyRead          = $policy.PermissionsToKeys -contains "Get" -or $policy.PermissionsToKeys -contains "List"
+                KeyWrite         = $policy.PermissionsToKeys -contains "Create" -or $policy.PermissionsToKeys -contains "Set" -or $policy.PermissionsToKeys -contains "Delete"
+                SecretRead       = $policy.PermissionsToSecrets -contains "Get" -or $policy.PermissionsToSecrets -contains "List"
+                SecretWrite      = $policy.PermissionsToSecrets -contains "Set" -or $policy.PermissionsToSecrets -contains "Delete"
+                CertRead         = $policy.PermissionsToCertificates -contains "Get" -or $policy.PermissionsToCertificates -contains "List"
+                CertWrite       = $policy.PermissionsToCertificates -contains "Create" -or $policy.PermissionsToCertificates -contains "Import" -or $policy.PermissionsToCertificates -contains "Delete"
+                KeyPermissions   = ($policy.PermissionsToKeys -join ", ")
+                SecretPermissions = ($policy.PermissionsToSecrets -join ", ")
+                CertPermissions = ($policy.PermissionsToCertificates -join ", ")
             }
-            
-            $results += $result
-            
-            # Display the information
-            Write-Host "  Principal: $principalName ($principalType)" -ForegroundColor White
-            Write-Host "    Object ID: $($policy.ObjectId)"
-            if ($policy.ApplicationId) {
-                Write-Host "    Application ID: $($policy.ApplicationId)"
-            }
-            Write-Host "    Key Permissions: $keyPermissions"
-            Write-Host "    Secret Permissions: $secretPermissions"
-            Write-Host "    Certificate Permissions: $certPermissions"
-            Write-Host "    Summary:" -ForegroundColor Yellow
-            Write-Host "      Key Read: $($result.HasKeyRead) | Key Write: $($result.HasKeyWrite)"
-            Write-Host "      Secret Read: $($result.HasSecretRead) | Secret Write: $($result.HasSecretWrite)"
-            Write-Host "      Cert Read: $($result.HasCertRead) | Cert Write: $($result.HasCertWrite)"
-            Write-Host ""
         }
+    } catch {
+        Write-Host "❌ Failed to retrieve policies for Key Vault: $vaultName. Error: $_" -ForegroundColor Red
     }
 }
 
-# Optionally export to CSV
-$exportPath = "KeyVaultAccessPolicies_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$results | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
-Write-Host "`nResults exported to $exportPath" -ForegroundColor Green
+# Export to CSV
+$outputPath = "AllKeyVaultAccessPolicies.csv"
+$allAccessPolicies | Export-Csv -Path $outputPath -NoTypeInformation -Encoding UTF8
 
-# Display summary table
-$results | Format-Table -Property KeyVaultName, PrincipalName, PrincipalType, 
-    @{Name="KeyR/W"; Expression={"$($_.HasKeyRead)/$($_.HasKeyWrite)"}}, 
-    @{Name="SecretR/W"; Expression={"$($_.HasSecretRead)/$($_.HasSecretWrite)"}}, 
-    @{Name="CertR/W"; Expression={"$($_.HasCertRead)/$($_.HasCertWrite)"}} -AutoSize
+# Display summary
+Write-Host "`n=== Access Policy Summary ===" -ForegroundColor Green
+$allAccessPolicies | Format-Table -Property KeyVaultName, PrincipalName, PrincipalType, 
+    @{Name="KeyR/W"; Expression={"$($_.KeyRead)/$($_.KeyWrite)"}}, 
+    @{Name="SecretR/W"; Expression={"$($_.SecretRead)/$($_.SecretWrite)"}}, 
+    @{Name="CertR/W"; Expression={"$($_.CertRead)/$($_.CertWrite)"}} -AutoSize
+
+Write-Host "`n✅ Export completed. File saved as '$outputPath'" -ForegroundColor Green
