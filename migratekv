@@ -1,0 +1,214 @@
+<#
+.SYNOPSIS
+    TEST VERSION: Converts Key Vault access policies to RBAC roles in a specified subscription
+.DESCRIPTION
+    Migrates traditional Key Vault access policies to Azure RBAC permissions
+    in a single subscription that you specify by subscription ID.
+.NOTES
+    Version: 1.1 (Manual Subscription ID Version)
+    Requirements: Az module 6.0+, Owner/User Access Administrator permissions
+#>
+
+param (
+    [Parameter(Mandatory=$true)]
+    [string]$SubscriptionId
+)
+
+# Connect to Azure
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+Connect-AzAccount
+
+# Set the specific subscription
+try {
+    Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+    $subscription = Get-AzSubscription -SubscriptionId $SubscriptionId
+    Write-Host "`nWORKING IN SUBSCRIPTION: $($subscription.Name) ($($subscription.Id))`n" -ForegroundColor Cyan
+}
+catch {
+    Write-Host "❌ Error setting subscription context: $_" -ForegroundColor Red
+    exit
+}
+
+# Function to determine RBAC role
+function Get-KeyVaultRBACRole {
+    param (
+        [string[]]$KeyPermissions,
+        [string[]]$SecretPermissions,
+        [string[]]$CertPermissions
+    )
+
+    $keyPerms = $KeyPermissions | ForEach-Object { $_.ToLower() }
+    $secretPerms = $SecretPermissions | ForEach-Object { $_.ToLower() }
+    $certPerms = $CertPermissions | ForEach-Object { $_.ToLower() }
+
+    # Key Vault Administrator (full access)
+    if (($keyPerms -contains 'all') -and ($secretPerms -contains 'all') -and ($certPerms -contains 'all')) {
+        return "Key Vault Administrator"
+    }
+
+    # Key Vault Crypto Officer (keys + secrets)
+    if (($keyPerms -contains 'all') -and ($secretPerms -contains 'all') -and (-not $certPerms)) {
+        return "Key Vault Crypto Officer"
+    }
+
+    # Key Vault Secrets Officer (secrets only)
+    if ((-not $keyPerms) -and ($secretPerms -contains 'all') -and (-not $certPerms)) {
+        return "Key Vault Secrets Officer"
+    }
+
+    # Key Vault Certificates Officer (certs only)
+    if ((-not $keyPerms) -and (-not $secretPerms) -and ($certPerms -contains 'all')) {
+        return "Key Vault Certificates Officer"
+    }
+
+    # Default to Administrator for custom permissions
+    return "Key Vault Administrator"
+}
+
+# Get all Key Vaults in the specified subscription
+Write-Host "Discovering Key Vaults in subscription..." -ForegroundColor Cyan
+$keyVaults = Get-AzKeyVault
+if (-not $keyVaults) {
+    Write-Host "No Key Vaults found in this subscription." -ForegroundColor Yellow
+    exit
+}
+
+# Dry run - show what will be changed
+Write-Host "`n=== DRY RUN: Planned Changes ===" -ForegroundColor Yellow
+$dryRunResults = @()
+
+foreach ($kv in $keyVaults) {
+    $policies = (Get-AzKeyVault -VaultName $kv.VaultName).AccessPolicies
+    
+    foreach ($policy in $policies) {
+        $roleName = Get-KeyVaultRBACRole -KeyPermissions $policy.PermissionsToKeys `
+                                         -SecretPermissions $policy.PermissionsToSecrets `
+                                         -CertPermissions $policy.PermissionsToCertificates
+        
+        $principal = try { 
+            (Get-AzADServicePrincipal -ObjectId $policy.ObjectId).DisplayName 
+        } catch { 
+            try { (Get-AzADUser -ObjectId $policy.ObjectId).DisplayName }
+            catch { try { (Get-AzADGroup -ObjectId $policy.ObjectId).DisplayName }
+                    catch { $policy.ObjectId } } 
+        }
+
+        $dryRunResults += [PSCustomObject]@{
+            KeyVault = $kv.VaultName
+            Principal = $principal
+            CurrentPermissions = "Keys: $($policy.PermissionsToKeys -join ', ')`nSecrets: $($policy.PermissionsToSecrets -join ', ')`nCerts: $($policy.PermissionsToCertificates -join ', ')"
+            NewRole = $roleName
+        }
+    }
+}
+
+# Display dry run results
+$dryRunResults | Format-Table -Property KeyVault, Principal, NewRole -AutoSize
+
+# Confirm before proceeding
+Write-Host "`n=== SUMMARY OF CHANGES ===" -ForegroundColor Cyan
+Write-Host "Key Vaults to process: $($keyVaults.Count)"
+Write-Host "Total policies to migrate: $($dryRunResults.Count)"
+Write-Host "Key Vault Administrators to assign: $($dryRunResults.Where({$_.NewRole -eq 'Key Vault Administrator'}).Count)"
+Write-Host "Key Vault Crypto Officers to assign: $($dryRunResults.Where({$_.NewRole -eq 'Key Vault Crypto Officer'}).Count)"
+Write-Host "Key Vault Secrets Officers to assign: $($dryRunResults.Where({$_.NewRole -eq 'Key Vault Secrets Officer'}).Count)"
+Write-Host "Key Vault Certificates Officers to assign: $($dryRunResults.Where({$_.NewRole -eq 'Key Vault Certificates Officer'}).Count)"
+
+$confirmation = Read-Host "`nDo you want to proceed with these changes? (Y/N)"
+if ($confirmation -ne 'Y') {
+    Write-Host "Migration cancelled." -ForegroundColor Yellow
+    exit
+}
+
+# Execute the migration
+Write-Host "`n=== STARTING MIGRATION ===" -ForegroundColor Green
+$results = @()
+$successCount = 0
+$failureCount = 0
+
+foreach ($kv in $keyVaults) {
+    Write-Host "`nProcessing Key Vault: $($kv.VaultName)" -ForegroundColor Cyan
+    
+    try {
+        $policies = (Get-AzKeyVault -VaultName $kv.VaultName).AccessPolicies
+        $scope = "/subscriptions/$($subscription.Id)/resourceGroups/$($kv.ResourceGroupName)/providers/Microsoft.KeyVault/vaults/$($kv.VaultName)"
+        
+        foreach ($policy in $policies) {
+            $roleName = Get-KeyVaultRBACRole -KeyPermissions $policy.PermissionsToKeys `
+                                             -SecretPermissions $policy.PermissionsToSecrets `
+                                             -CertPermissions $policy.PermissionsToCertificates
+            
+            try {
+                # Assign RBAC role
+                $assignment = New-AzRoleAssignment -ObjectId $policy.ObjectId `
+                                                  -RoleDefinitionName $roleName `
+                                                  -Scope $scope `
+                                                  -ErrorAction Stop
+                
+                # Remove old access policy
+                Remove-AzKeyVaultAccessPolicy -VaultName $kv.VaultName `
+                                             -ObjectId $policy.ObjectId `
+                                             -ErrorAction Stop
+                
+                $results += [PSCustomObject]@{
+                    Timestamp = Get-Date
+                    KeyVault = $kv.VaultName
+                    ResourceGroup = $kv.ResourceGroupName
+                    Principal = $assignment.DisplayName
+                    ObjectId = $policy.ObjectId
+                    ApplicationId = $policy.ApplicationId
+                    NewRole = $roleName
+                    Status = "Success"
+                    OldPermissions = @{
+                        Keys = $policy.PermissionsToKeys
+                        Secrets = $policy.PermissionsToSecrets
+                        Certificates = $policy.PermissionsToCertificates
+                    } | ConvertTo-Json -Compress
+                }
+                
+                $successCount++
+                Write-Host "  [SUCCESS] Assigned $roleName to $($assignment.DisplayName)" -ForegroundColor Green
+            }
+            catch {
+                $results += [PSCustomObject]@{
+                    Timestamp = Get-Date
+                    KeyVault = $kv.VaultName
+                    ResourceGroup = $kv.ResourceGroupName
+                    Principal = $policy.ObjectId
+                    ObjectId = $policy.ObjectId
+                    ApplicationId = $policy.ApplicationId
+                    NewRole = $roleName
+                    Status = "Failed: $_"
+                    OldPermissions = @{
+                        Keys = $policy.PermissionsToKeys
+                        Secrets = $policy.PermissionsToSecrets
+                        Certificates = $policy.PermissionsToCertificates
+                    } | ConvertTo-Json -Compress
+                }
+                $failureCount++
+                Write-Host "  [FAILED] $($policy.ObjectId): $_" -ForegroundColor Red
+            }
+        }
+    }
+    catch {
+        Write-Host "  ❌ Error processing Key Vault $($kv.VaultName): $_" -ForegroundColor Red
+    }
+}
+
+# Generate detailed report
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$reportPath = "KeyVaultRBACMigration_$($subscription.Name)_$timestamp.csv"
+$results | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
+
+# Final summary
+Write-Host "`n=== MIGRATION COMPLETE ===" -ForegroundColor Green
+Write-Host "Successfully migrated: $successCount policies" -ForegroundColor Green
+Write-Host "Failed migrations: $failureCount" -ForegroundColor ($failureCount -gt 0 ? "Red" : "Green")
+Write-Host "Detailed report saved to: $reportPath" -ForegroundColor Cyan
+
+# Display sample results
+Write-Host "`nSample of migrated policies:" -ForegroundColor Cyan
+$results | Select-Object -First 5 | Format-Table -Property KeyVault, Principal, NewRole, Status -AutoSize
+
+Write-Host "`nScript completed. Press any key to exit..." -ForegroundColor Cyan
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
