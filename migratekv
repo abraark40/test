@@ -1,13 +1,17 @@
 <#
 .SYNOPSIS
-    COMPLETE MIGRATION: Converts Key Vault from access policy to RBAC model
+    Key Vault Access Policy to RBAC Migration Script (Azure PowerShell)
 .DESCRIPTION
-    1. Migrates all access policies to RBAC roles (Key Vault Administrator)
-    2. Switches Key Vault permission model to RBAC
-    3. Removes legacy access policies
+    Migrates Key Vaults from access policy to RBAC model while:
+    1. Converting all access policies to RBAC roles (Key Vault Administrator)
+    2. Switching permission model to RBAC
+    3. Removing legacy access policies
 .NOTES
-    Version: 3.0 (Complete Migration)
-    Requirements: Owner or User Access Administrator + Key Vault Administrator
+    Version: 1.0 (Azure PowerShell Edition)
+    Assumes: Already authenticated in Azure PowerShell environment
+    Required Permissions: 
+      - Key Vault Contributor
+      - User Access Administrator (for RBAC assignments)
 #>
 
 param (
@@ -15,36 +19,38 @@ param (
     [string]$SubscriptionId
 )
 
-# Connect to Azure
-Write-Host "Connecting to Azure..." -ForegroundColor Cyan
-Connect-AzAccount
+# Initialize variables
+$results = @()
+$retryCount = 3
+$currentContext = Get-AzContext
+
+# Verify we're in Azure PowerShell
+if (-not $currentContext) {
+    Write-Host "ERROR: Not connected to Azure. Use Connect-AzAccount first." -ForegroundColor Red
+    exit
+}
+
+Write-Host "Running as: $($currentContext.Account.Id)" -ForegroundColor Cyan
+Write-Host "Target Subscription: $SubscriptionId" -ForegroundColor Cyan
 
 # Set subscription context
 try {
-    Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
-    $subscription = Get-AzSubscription -SubscriptionId $SubscriptionId
-    Write-Host "`nTARGET SUBSCRIPTION: $($subscription.Name) ($($subscription.Id))`n" -ForegroundColor Cyan
+    Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null
 }
 catch {
-    Write-Host "❌ Error setting subscription context: $_" -ForegroundColor Red
+    Write-Host "ERROR: Failed to set subscription context: $_" -ForegroundColor Red
     exit
 }
 
-# Initialize results
-$results = @()
-$vaultsUpdated = 0
-
-# Get all Key Vaults
-Write-Host "Discovering Key Vaults..." -ForegroundColor Cyan
+# Get all Key Vaults in the subscription
 $keyVaults = Get-AzKeyVault
 if (-not $keyVaults) {
-    Write-Host "No Key Vaults found." -ForegroundColor Yellow
+    Write-Host "No Key Vaults found in this subscription." -ForegroundColor Yellow
     exit
 }
 
-# Process each Key Vault
 foreach ($kv in $keyVaults) {
-    Write-Host "`nPROCESSING KEY VAULT: $($kv.VaultName)" -ForegroundColor Magenta
+    Write-Host "`nProcessing Key Vault: $($kv.VaultName)" -ForegroundColor Magenta
     
     # Skip if already in RBAC mode
     if ($kv.EnableRbacAuthorization) {
@@ -52,11 +58,12 @@ foreach ($kv in $keyVaults) {
         continue
     }
 
-    # Step 1: Migrate access policies to RBAC
+    # Get current access policies
     try {
         $policies = (Get-AzKeyVault -VaultName $kv.VaultName -ResourceGroupName $kv.ResourceGroupName).AccessPolicies
-        $scope = "/subscriptions/$($subscription.Id)/resourceGroups/$($kv.ResourceGroupName)/providers/Microsoft.KeyVault/vaults/$($kv.VaultName)"
+        $scope = "/subscriptions/$SubscriptionId/resourceGroups/$($kv.ResourceGroupName)/providers/Microsoft.KeyVault/vaults/$($kv.VaultName)"
         
+        # Step 1: Migrate each access policy to RBAC role
         foreach ($policy in $policies) {
             $principalName = try {
                 (Get-AzADServicePrincipal -ObjectId $policy.ObjectId).DisplayName ??
@@ -79,35 +86,62 @@ foreach ($kv in $keyVaults) {
                     Principal      = $principalName
                     ObjectId       = $policy.ObjectId
                     RBACAssignment = "Success"
-                    PolicyRemoval  = "Pending"
                 }
-                Write-Host "    ✓ RBAC assigned" -ForegroundColor Green
+                Write-Host "    ✓ RBAC role assigned" -ForegroundColor Green
             }
             catch {
-                Write-Host "    ❌ RBAC assignment failed: $_" -ForegroundColor Red
                 $results += [PSCustomObject]@{
                     KeyVault       = $kv.VaultName
                     Principal      = $principalName
                     ObjectId       = $policy.ObjectId
                     RBACAssignment = "Failed: $_"
-                    PolicyRemoval  = "Skipped"
                 }
+                Write-Host "    ❌ RBAC assignment failed: $_" -ForegroundColor Red
                 continue
             }
         }
 
-        # Step 2: Enable RBAC mode on the Key Vault
+        # Step 2: Enable RBAC permission model
         try {
             Write-Host "  Switching to RBAC permission model..." -ForegroundColor Cyan
-            Update-AzKeyVault -VaultName $kv.VaultName `
-                             -ResourceGroupName $kv.ResourceGroupName `
-                             -EnableRbacAuthorization $true `
-                             -ErrorAction Stop
+            $updatedVault = $null
+            
+            for ($i = 1; $i -le $retryCount; $i++) {
+                try {
+                    $updatedVault = Update-AzKeyVault -VaultName $kv.VaultName `
+                                                     -ResourceGroupName $kv.ResourceGroupName `
+                                                     -EnableRbacAuthorization $true `
+                                                     -ErrorAction Stop
+                    break
+                }
+                catch {
+                    if ($i -eq $retryCount) { throw }
+                    Write-Host "    ⚠️ Attempt $i failed, retrying in 5 seconds..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds 5
+                }
+            }
 
-            Write-Host "    ✓ RBAC mode enabled" -ForegroundColor Green
-            $vaultsUpdated++
+            if ($updatedVault.EnableRbacAuthorization) {
+                Write-Host "    ✓ RBAC permission model enabled" -ForegroundColor Green
+                $results += [PSCustomObject]@{
+                    KeyVault    = $kv.VaultName
+                    RBACMode    = "Enabled"
+                    Status      = "Success"
+                }
+            }
+        }
+        catch {
+            Write-Host "    ❌ Failed to enable RBAC mode: $_" -ForegroundColor Red
+            $results += [PSCustomObject]@{
+                KeyVault    = $kv.VaultName
+                RBACMode    = "Failed"
+                Status      = "Error: $_"
+            }
+            continue
+        }
 
-            # Step 3: Remove legacy access policies (only if RBAC mode succeeded)
+        # Step 3: Remove legacy access policies (only if RBAC was enabled)
+        if ($updatedVault -and $updatedVault.EnableRbacAuthorization) {
             try {
                 Write-Host "  Removing legacy access policies..." -ForegroundColor Cyan
                 foreach ($policy in $policies) {
@@ -117,56 +151,37 @@ foreach ($kv in $keyVaults) {
                                                  -ErrorAction SilentlyContinue
                 }
                 Write-Host "    ✓ Legacy policies removed" -ForegroundColor Green
-
-                # Update results
-                $results | Where-Object { 
-                    $_.KeyVault -eq $kv.VaultName -and $_.PolicyRemoval -eq "Pending" 
-                } | ForEach-Object { $_.PolicyRemoval = "Success" }
             }
             catch {
-                Write-Host "    ❌ Policy removal failed: $_" -ForegroundColor Red
-                $results | Where-Object { 
-                    $_.KeyVault -eq $kv.VaultName -and $_.PolicyRemoval -eq "Pending" 
-                } | ForEach-Object { $_.PolicyRemoval = "Failed: $_" }
-            }
-        }
-        catch {
-            Write-Host "    ❌ Failed to enable RBAC mode: $_" -ForegroundColor Red
-            $results += [PSCustomObject]@{
-                KeyVault       = $kv.VaultName
-                Principal      = "N/A"
-                ObjectId       = "N/A"
-                RBACAssignment = "N/A"
-                PolicyRemoval  = "RBAC mode enable failed: $_"
+                Write-Host "    ⚠️ Policy cleanup failed: $_" -ForegroundColor Yellow
             }
         }
     }
     catch {
         Write-Host "  ❌ Error processing Key Vault: $_" -ForegroundColor Red
         $results += [PSCustomObject]@{
-            KeyVault       = $kv.VaultName
-            Principal      = "N/A"
-            ObjectId       = "N/A"
-            RBACAssignment = "Key Vault processing failed: $_"
-            PolicyRemoval  = "N/A"
+            KeyVault    = $kv.VaultName
+            Status      = "Processing Error: $_"
         }
     }
 }
 
-# Generate reports
+# Generate report
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $reportPath = "KeyVaultRBACMigration_$timestamp.csv"
 $results | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
 
-# Summary
-Write-Host "`n=== MIGRATION COMPLETE ===" -ForegroundColor Green
+# Display summary
+Write-Host "`n=== MIGRATION SUMMARY ===" -ForegroundColor Green
 Write-Host "Key Vaults processed: $($keyVaults.Count)"
-Write-Host "Key Vaults updated to RBAC: $vaultsUpdated"
-Write-Host "Total principals migrated: $($results.Where({$_.RBACAssignment -eq 'Success'}).Count)"
-Write-Host "`nDetailed report saved to: $reportPath" -ForegroundColor Cyan
+Write-Host "Successful RBAC assignments: $($results.Where({$_.RBACAssignment -eq 'Success'}).Count)"
+Write-Host "Failed RBAC assignments: $($results.Where({$_.RBACAssignment -like 'Failed*'}).Count)"
+Write-Host "Key Vaults switched to RBAC: $($results.Where({$_.RBACMode -eq 'Enabled'}).Count)"
+Write-Host "`nFull report saved to: $reportPath" -ForegroundColor Cyan
 
-# Show sample results
-$results | Select-Object -First 10 | Format-Table -AutoSize
-
-Write-Host "`nPress any key to exit..."
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+# Show failures if any
+$failures = $results | Where-Object { $_.Status -like "*Error*" -or $_.RBACAssignment -like "*Failed*" }
+if ($failures) {
+    Write-Host "`n=== FAILURES NEEDING ATTENTION ===" -ForegroundColor Red
+    $failures | Format-Table -AutoSize
+}
